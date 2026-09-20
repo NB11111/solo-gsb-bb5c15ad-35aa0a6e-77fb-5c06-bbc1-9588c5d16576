@@ -1,5 +1,8 @@
 """Unit tests for Accept-Language parsing and negotiation core."""
 
+import random
+from itertools import combinations
+
 import pytest
 
 from app.negotiation import (
@@ -10,6 +13,7 @@ from app.negotiation import (
     SampleHeaderError,
     analyze_q_stability,
     assess_change_impact,
+    minimize_header,
     negotiate,
     negotiate_group,
     normalize_fallbacks,
@@ -1610,3 +1614,235 @@ class TestConfigProbes:
         assert [g["configs"] for g in result["indistinguishable_groups"]] == [
             ["a", "b", "c", "d"]
         ]
+
+
+class TestMinimizeHeader:
+    SUPPORTED = ["en-US", "zh-CN", "zh-TW", "ja-JP"]
+    DEFAULT = "en-US"
+
+    def _key(self, result):
+        locale = result.get("locale_fallback")
+        path = tuple(locale["path"]) if locale is not None else None
+        return result["selected_language"], result["fallback"], path
+
+    def test_baseline_matches_negotiate(self):
+        header = "zh-CN,zh;q=0.9,en;q=0.8,*;q=0.5"
+        result = minimize_header(header, self.SUPPORTED, self.DEFAULT)
+        assert result["baseline"] == negotiate(header, self.SUPPORTED, self.DEFAULT)
+
+    def test_single_winning_range_suffices(self):
+        result = minimize_header(
+            "zh-CN,zh;q=0.9,en;q=0.8,*;q=0.5",
+            self.SUPPORTED,
+            self.DEFAULT,
+        )
+        assert result["minimal_header"] == "zh-CN"
+        assert result["kept_positions"] == [1]
+        assert result["removed_positions"] == [2, 3, 4]
+        reproduction = negotiate(
+            result["minimal_header"], self.SUPPORTED, self.DEFAULT
+        )
+        assert self._key(reproduction) == self._key(result["baseline"])
+
+    def test_wildcard_range_can_be_essential(self):
+        # Nothing concrete matches; the wildcard alone reproduces the
+        # default-language hit and the concrete q=0 range is irrelevant.
+        result = minimize_header(
+            "fr;q=0.9,de;q=0.8,*;q=0.5", self.SUPPORTED, self.DEFAULT
+        )
+        assert result["minimal_header"] == "*;q=0.5"
+        assert result["kept_positions"] == [3]
+        assert result["removed_positions"] == [1, 2]
+        assert result["reproduction"]["selected_language"] == "en-US"
+        assert result["reproduction"]["fallback"] is False
+
+    def test_default_fallback_case_keeps_one_unmatched_range(self):
+        result = minimize_header("fr,de", self.SUPPORTED, self.DEFAULT)
+        # Any single unmatched concrete range reproduces the default
+        # fallback; position 1 wins the lexicographic tie-break.
+        assert result["minimal_header"] == "fr"
+        assert result["kept_positions"] == [1]
+        assert result["removed_positions"] == [2]
+        assert result["reproduction"]["fallback"] is True
+        assert (
+            result["reproduction"]["fallback_reason"]
+            == "no-acceptable-candidate"
+        )
+
+    def test_q_zero_range_can_be_essential(self):
+        # Supported order makes the wildcard select ja-JP; ja;q=0 vetoes
+        # it so en-US wins. Removing the q=0 element flips the outcome,
+        # and removing the wildcard causes a default fallback instead.
+        result = minimize_header(
+            "ja;q=0,*;q=0.5", ["ja-JP", "en-US"], "en-US"
+        )
+        assert result["minimal_header"] == "ja;q=0,*;q=0.5"
+        assert result["kept_positions"] == [1, 2]
+        assert result["removed_positions"] == []
+        assert result["reproduction"]["selected_language"] == "en-US"
+        assert result["reproduction"]["fallback"] is False
+
+    def test_locale_fallback_path_must_match(self):
+        fallbacks = {"gsw": "de", "de": "zh-TW", "fr": "ja-JP"}
+        result = minimize_header(
+            "gsw;q=0.9,it;q=0.4,fr;q=0.5",
+            self.SUPPORTED,
+            self.DEFAULT,
+            fallbacks,
+        )
+        assert result["minimal_header"] == "gsw;q=0.9"
+        assert result["kept_positions"] == [1]
+        assert result["removed_positions"] == [2, 3]
+        locale = result["reproduction"]["locale_fallback"]
+        assert locale["path"] == ["gsw", "de", "zh-tw"]
+        assert locale["selected_language"] == "zh-TW"
+
+    def test_equal_selected_and_fallback_but_different_chain_path_rejected(self):
+        # gsw reaches zh-TW directly while it routes through zh-CN in the
+        # second chain; both are non-fallback hits of zh-TW, so a subset
+        # reaching it via a different (or no) chain path must not count.
+        fallbacks = {"gsw": "zh-CN", "zh-CN": "zh-TW"}
+        result = minimize_header(
+            "gsw,fr;q=0.1",
+            ["zh-TW", "ja-JP"],
+            "ja-JP",
+            fallbacks,
+        )
+        assert result["kept_positions"] == [1]
+        assert result["reproduction"]["locale_fallback"]["path"] == [
+            "gsw",
+            "zh-cn",
+            "zh-tw",
+        ]
+        # "fr" alone triggers the default fallback (ja-JP), which does
+        # not reproduce the baseline, so it must be removed.
+        assert result["removed_positions"] == [2]
+
+    def test_duplicate_occurrences_never_emitted_in_sub_header(self):
+        header = "de;q=0.9,en;q=0.1,en;q=0.5,*;q=0.05"
+        result = minimize_header(header, self.SUPPORTED, self.DEFAULT)
+        # The baseline winner is en-US via the FIRST en occurrence
+        # (q=0.1); later duplicate "en;q=0.5" is ignored and must never
+        # appear in the rebuilt header.
+        assert result["minimal_header"] == "en;q=0.1"
+        assert result["kept_positions"] == [2]
+        assert result["removed_positions"] == [1, 4]
+        assert result["reproduction"]["ignored_duplicates"] == []
+        assert result["baseline"]["ignored_duplicates"] == [
+            {"range": "en", "position": 3}
+        ]
+
+    def test_serialized_length_tie_break_prefers_wildcard(self):
+        # A concrete single range "x-aaaaaaaa" and the wildcard both
+        # select the only supported tag; the wildcard serializes shorter.
+        result = minimize_header(
+            "x-aaaaaaaa,*", ["x-aaaaaaaa"], "x-aaaaaaaa"
+        )
+        assert result["minimal_header"] == "*"
+        assert result["kept_positions"] == [2]
+        assert result["removed_positions"] == [1]
+
+    def test_position_sequence_tie_break_prefers_earlier_position(self):
+        # Two equally long unmatched ranges both reproduce the default
+        # fallback on their own; the earlier position wins.
+        result = minimize_header("xx,yy", self.SUPPORTED, self.DEFAULT)
+        assert result["minimal_header"] == "xx"
+        assert result["kept_positions"] == [1]
+        assert result["removed_positions"] == [2]
+
+    def test_rebuilt_header_strips_surrounding_ows(self):
+        result = minimize_header(
+            " zh-CN , en ; q = 0.8 ", self.SUPPORTED, self.DEFAULT
+        )
+        assert result["minimal_header"] == "zh-CN"
+        assert result["reproduction"]["selected_language"] == "zh-CN"
+
+    def test_blank_or_missing_header_raises(self):
+        with pytest.raises(AcceptLanguageError, match="1～12"):
+            minimize_header(None, self.SUPPORTED, self.DEFAULT)
+        with pytest.raises(AcceptLanguageError, match="1～12"):
+            minimize_header("   ", self.SUPPORTED, self.DEFAULT)
+
+    def test_more_than_twelve_distinct_ranges_raises(self):
+        header = ",".join(f"x-tag{i:02d}" for i in range(13))
+        with pytest.raises(AcceptLanguageError, match="12"):
+            minimize_header(header, self.SUPPORTED, self.DEFAULT)
+
+    def test_exactly_twelve_distinct_ranges_accepted(self):
+        header = ",".join(f"x-tag{i:02d}" for i in range(11)) + ",*;q=0.1"
+        assert len(parse_accept_language(header)) == 12
+        result = minimize_header(header, self.SUPPORTED, self.DEFAULT)
+        assert result["kept_positions"] == [12]
+        assert result["minimal_header"] == "*;q=0.1"
+
+    def test_syntax_error_propagates(self):
+        with pytest.raises(AcceptLanguageError):
+            minimize_header("en;q=2", self.SUPPORTED, self.DEFAULT)
+
+    def test_matches_independent_global_enumeration_oracle(self):
+        # Independent brute-force reference over random headers:
+        # enumerate every non-empty order-preserving subset and apply
+        # the exact documented ranking (size, serialized length,
+        # position tuple); minimize_header must return the same winner.
+        rng = random.Random(20260920)
+        tags = [
+            "en",
+            "en-US",
+            "zh",
+            "zh-CN",
+            "zh-TW",
+            "ja",
+            "fr",
+            "de",
+            "gsw",
+            "*",
+        ]
+        for _ in range(120):
+            n = rng.randint(1, 8)
+            elements = []
+            used: set[str] = set()
+            while len(elements) < n:
+                tag = rng.choice(tags)
+                if tag in used:
+                    continue
+                used.add(tag)
+                token = tag
+                if rng.random() < 0.6:
+                    step = rng.randint(0, 10) / 10
+                    token += f";q={step:g}"
+                elements.append(token)
+            header = ",".join(elements)
+            parsed = parse_accept_language(header)
+            baseline = negotiate(header, self.SUPPORTED, self.DEFAULT)
+            baseline_key = self._key(baseline)
+
+            best = None
+            for size in range(1, len(parsed) + 1):
+                for combo in combinations(
+                    list(enumerate(parsed, start=1)), size
+                ):
+                    positions = tuple(position for position, _ in combo)
+                    sub = ",".join(
+                        elements[position - 1]
+                        for position, _ in combo
+                    )
+                    repro = negotiate(sub, self.SUPPORTED, self.DEFAULT)
+                    if self._key(repro) != baseline_key:
+                        continue
+                    key = (size, len(sub), positions)
+                    if best is None or key < best[0]:
+                        best = (key, sub, positions)
+                if best is not None:
+                    break
+            assert best is not None  # the full header always reproduces
+
+            result = minimize_header(header, self.SUPPORTED, self.DEFAULT)
+            assert result["minimal_header"] == best[1]
+            assert tuple(result["kept_positions"]) == best[2]
+            assert (
+                len(result["kept_positions"])
+                + len(result["removed_positions"])
+                == len(parsed)
+            )
+            assert self._key(result["reproduction"]) == baseline_key
+

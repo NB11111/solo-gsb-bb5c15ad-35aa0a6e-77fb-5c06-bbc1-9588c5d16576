@@ -29,6 +29,13 @@ traffic 的 `Accept-Language` 流量样本与 1～12 个候选新增语言，穷
 **区分**这对配置。服务端穷举选出能覆盖全部可区分配置对的**最少候选**（同数按候选
 下标序列字典序决胜），返回每个探针在各配置下的结果与它新增覆盖的配置对，以及在
 所有候选头下结果签名完全相同、因而无法区分的配置组。
+`/api/v1/negotiate/minimize-header` 提供**最小复现头**：请求体沿用单人协商配置
+（同样支持 `locale_fallbacks`），但 `Accept-Language` 必须含 **1～12 个去重后范围**。
+服务端先给出基准结果，再对去重后范围的**全部保序非空子集做全局枚举**（不使用逐项
+贪心），用保留范围的首次出现原元素重建子头并重新协商，选出仍保持
+`selected_language`、`fallback` 及**实际 `locale_fallback` 路径**三者一致的最小
+复现头；范围数相同时依次取**序列化长度更短**、**原位置序列字典序更小**者，返回
+最小头、保留/移除的原位置与基准、复现两份完整结果。
 
 技术栈：Python 3.12 · FastAPI · Pydantic v2 · Uvicorn，依赖在容器构建时安装。
 
@@ -50,6 +57,7 @@ docker compose up -d --build
 | http://localhost:8000/api/v1/negotiate/coverage-plan | 候选语言覆盖规划接口（`POST`） |
 | http://localhost:8000/api/v1/negotiate/change-impact | 语言配置变更影响评估接口（`POST`） |
 | http://localhost:8000/api/v1/negotiate/config-probes | 多套语言配置的最少区分探针规划接口（`POST`） |
+| http://localhost:8000/api/v1/negotiate/minimize-header | 最小复现 Accept-Language 头接口（`POST`） |
 | http://localhost:8000/docs | Swagger UI 交互式文档 |
 | http://localhost:8000/openapi.json | OpenAPI 3 描述 |
 
@@ -796,6 +804,93 @@ curl -X POST http://localhost:8000/api/v1/negotiate/config-probes \
 `default_language`、`locale_fallbacks` 校验与单人接口完全一致，错误定位到对应
 配置内（如 `["body","configs",0,"locale_fallbacks"]`）。
 
+## 最小复现头（POST /api/v1/negotiate/minimize-header）
+
+当需要排查「究竟是哪几个语言范围决定了这次协商结果？」时（例如精简客户端探针、
+复现线上协商、定位 q=0 排除与回退链的最小触发条件），使用最小复现头接口。
+**请求体与单人协商接口完全相同**（同样支持 `locale_fallbacks`，配置校验规则也
+一致），但要求 `accept_language` 是一个含 **1～12 个去重后语言范围**的合法头。
+
+服务端先按现有规则跑一次**基准协商**，再对去重后范围做**全局枚举**：
+
+1. 枚举去重后范围的**全部保序非空子集**（按原头顺序保留，不得重排）；每个子集用
+   保留范围的**首次出现原始元素**（保留原 q 拼写与大小写，去掉元素外围空白）以
+   逗号拼接成子头，重复出现被忽略的后续元素**永不进入**子头；
+2. 每个子头都复用 `/negotiate` 的完整语义重新协商；只有 `selected_language`、
+   `fallback` 标记与**实际 `locale_fallback` 路径**（链未触发时按「无路径」）
+   三者都与基准一致才算复现——两个子头即使选中同一标签，一个走
+   `gsw → de → zh-TW`、另一个走 `gsw → zh-TW`，路径不同也**不算**复现；
+3. 选复现子集中**范围数最少**的；范围数相同时依次取**序列化长度更短**、**原位置
+   序列字典序更小**者（如位置 `(1,)` 胜 `(2,)`，`(1,2)` 胜 `(1,3)`）。
+
+选择是对所有子集的**全局穷举**，不是「从头逐个删、能删就删」的逐项贪心——后者在
+多个范围各自对不同移除方式必不可少的情形下可能给出非最小子集。空子集不参与枚举
+（空头会变成 `no-valid-range` 默认兜底，不属于原头的复现）。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/negotiate/minimize-header \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "accept_language": "zh-CN,zh;q=0.9,en;q=0.8,*;q=0.5",
+    "supported_languages": ["en-US", "zh-CN", "zh-TW", "ja-JP"],
+    "default_language": "en-US"
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "minimal_header": "zh-CN",
+  "kept_positions": [1],
+  "removed_positions": [2, 3, 4],
+  "baseline": {
+    "selected_language": "zh-CN",
+    "fallback": false,
+    "locale_fallback": null
+  },
+  "reproduction": {
+    "selected_language": "zh-CN",
+    "fallback": false
+  },
+  "message": "全局枚举去重后 4 个语言范围的全部保序非空子集后，保留原位置 [1] 的 1 个范围即可复现 selected_language、fallback 与实际 locale_fallback 路径（同数依次按序列化长度更短、原位置序列字典序更小取舍；未使用逐项贪心）"
+}
+```
+
+> 实际响应中 `baseline` / `reproduction` 都是与 `/negotiate` 逐字段一致的完整
+> 协商结果；上例链未触发，因此两者都**不含** `locale_fallback` 键（不会返回
+> `null`）。当基准由链命中时，`reproduction.locale_fallback.path` 必须与
+> `baseline.locale_fallback.path` 完全相同，否则该子集不会入选。
+
+### 最小复现头请求体
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `accept_language` | string | 是 | 原始 `Accept-Language` 头；必须合法且含 **1～12 个去重后范围**（缺失/`null`/空白或去重后超过 12 个均返回 422） |
+| `supported_languages` | string[] | 是 | 与单人接口相同（顺序即稳定优先级） |
+| `default_language` | string | 是 | 与单人接口相同（必须在支持列表中） |
+| `locale_fallbacks` | object<string,string> \| null | 否 | 与单人接口相同；复现必须走到与基准**相同的实际链路径** |
+
+### 最小复现头响应字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `minimal_header` | 最小复现 `Accept-Language` 头：保留范围首次出现原元素按原序拼接（元素外围 OWS 空白被去除） |
+| `kept_positions` | 保留范围在**原头**中的位置（从 1 开始，升序；只计去重后保留的首次出现） |
+| `removed_positions` | 移除的去重范围首次出现位置（从 1 开始，升序）；与 `kept_positions` 恰好划分全部去重后位置。被「保留第一次出现」规则忽略的重复出现不属于这两个列表（见 `baseline.ignored_duplicates`），它们同样不会出现在 `minimal_header` 中 |
+| `baseline` | 基准完整协商结果，结构与 `POST /api/v1/negotiate` 逐字段一致 |
+| `reproduction` | 用 `minimal_header` 重新协商的完整结果；其三要素（`selected_language`、`fallback`、实际 `locale_fallback` 路径）与 `baseline` 完全一致 |
+
+例如头 `ja;q=0,*;q=0.5` 配合 `supported_languages=["ja-JP","en-US"]`：通配符按
+服务端顺序本应选中 `ja-JP`，而 `ja;q=0` 恰好把它否决，最终选出 `en-US`。两个范围
+缺一结果就变，因此最小头就是原头本身（`kept_positions=[1,2]`、
+`removed_positions=[]`）。
+
+校验（均返回 **HTTP 422**，非法头 `loc` 为 `["body","accept_language"]`、`type`
+为 `accept_language.syntax_error`）：头缺失/`null`/空白、去重后范围数超过 12、
+头语法非法（如 `en;q=2`）；其余请求体校验（`supported_languages`、
+`default_language`、`locale_fallbacks`）与单人接口完全一致。
+
 ## 协商规则
 
 1. **q 权重**：遵循 RFC 9110，缺省 `q=1`；合法写法为 `0`–`1`、最多 3 位小数
@@ -883,7 +978,7 @@ docker run --rm -p 8000:8000 -e UVICORN_WORKERS=2 language-negotiator
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000
-pytest -q          # 210 个单元/接口测试
+pytest -q          # 236 个单元/接口测试
 ```
 
 ## 项目结构

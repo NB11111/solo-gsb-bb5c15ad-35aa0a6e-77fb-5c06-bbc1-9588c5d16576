@@ -61,6 +61,15 @@ Implements the negotiation rules required by the service:
   separate every distinguishable pair, ties broken by the lexicographic
   candidate-index tuple. Configurations left mutually indistinguishable
   (identical signatures across every candidate) are reported as groups.
+* :func:`minimize_header` likewise reuses :func:`negotiate`: after a
+  baseline run it enumerates **every non-empty order-preserving subset**
+  of the de-duplicated header ranges (never an item-by-item greedy
+  pass), rebuilds a sub-header from each subset's first-occurrence raw
+  elements, and keeps the smallest subset whose reproduction still
+  matches the baseline in ``selected_language``, ``fallback`` and the
+  actual ``locale_fallback`` path. Same-size subsets are ranked by the
+  serialized header length, then by the lexicographic original-position
+  sequence.
 
 Language tag grammar follows RFC 5646 (BCP 47) primary tag grammar, which
 covers every ordinary language tag (the legacy "grandfathered" irregular
@@ -78,6 +87,12 @@ from typing import Any
 # RFC 9110 quality values carry at most three fractional digits, so the
 # legal q grid has 1001 points from 0.000 through 1.000 inclusive.
 Q_GRID_STEPS = 1000
+
+# Header minimization only accepts a header whose de-duplicated range
+# count lies in this closed interval; a missing/blank header or one with
+# too many distinct ranges is rejected with the same 422 envelope.
+MINIMIZE_MIN_RANGES = 1
+MINIMIZE_MAX_RANGES = 12
 
 # RFC 5646 section 2.1 grammar (main tag grammar, no grandfathered tags).
 _PRIVATEUSE = r"x(?:-[0-9a-z]{1,8})+"
@@ -1617,5 +1632,147 @@ def plan_config_probes(
         "total_pair_count": total_pair_count,
         "distinguishable_pair_count": distinguishable_pair_count,
         "indistinguishable_groups": indistinguishable_groups,
+        "message": message,
+    }
+
+
+def _outcome_key(result: dict[str, Any]) -> tuple[Any, ...]:
+    """Identity of a negotiation outcome for header minimization.
+
+    Two runs reproduce each other only when ``selected_language``, the
+    ``fallback`` flag *and* the actually walked locale_fallbacks chain
+    path all agree: a normal hit, a default fallback, and a hit reached
+    through different ``locale_fallbacks`` paths are three distinct
+    outcomes even when the selected tag or the fallback flag coincide.
+    """
+
+    locale = result.get("locale_fallback")
+    path = tuple(locale["path"]) if locale is not None else None
+    return (result["selected_language"], result["fallback"], path)
+
+
+def minimize_header(
+    header: str | None,
+    supported: list[str],
+    default: str,
+    locale_fallbacks: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Find the smallest order-preserving sub-header reproducing the outcome.
+
+    The configuration fields are exactly those of :func:`negotiate`. The
+    header must parse without errors and contain 1..12 de-duplicated
+    ranges (a missing/blank header or more than 12 distinct ranges raises
+    :class:`AcceptLanguageError`, surfaced as the usual 422).
+
+    After the baseline run, **every non-empty order-preserving subset**
+    of the de-duplicated ranges is enumerated globally -- this is
+    deliberately not an item-by-item greedy removal, which could report
+    a non-minimal subset when several ranges are individually essential
+    under different removals. Each subset rebuilds a sub-header from the
+    retained ranges' first-occurrence raw comma-separated elements
+    (later duplicate occurrences are never emitted), and the subset is
+    replayed through :func:`negotiate`. A subset reproduces the baseline
+    only when ``selected_language``, ``fallback`` and the actual
+    ``locale_fallback`` path (or the absence of a chain hit) all match.
+
+    Among reproducing subsets the winner has the fewest ranges; ties are
+    broken first by the shorter serialized sub-header, then by the
+    lexicographically smaller tuple of original 1-based header
+    positions. Returns the baseline result, the full result replayed on
+    the minimal header, and the retained/removed first-occurrence
+    positions.
+    """
+
+    parsed = parse_accept_language(header)
+    range_count = len(parsed)
+    if range_count < MINIMIZE_MIN_RANGES:
+        raise AcceptLanguageError(
+            "minimize-header 要求 Accept-Language 头含 "
+            f"{MINIMIZE_MIN_RANGES}～{MINIMIZE_MAX_RANGES} 个去重后语言范围，"
+            "缺失或空白头无法最小化"
+        )
+    if range_count > MINIMIZE_MAX_RANGES:
+        raise AcceptLanguageError(
+            f"minimize-header 最多接受 {MINIMIZE_MAX_RANGES} 个去重后语言范围，"
+            f"当前为 {range_count} 个"
+        )
+
+    baseline = negotiate(
+        header=header,
+        supported=supported,
+        default=default,
+        locale_fallbacks=locale_fallbacks,
+    )
+    baseline_key = _outcome_key(baseline)
+
+    # First-occurrence raw element per de-duplicated range, keyed by the
+    # range's 1-based header position. OWS around an element is stripped
+    # so the rebuilt header is canonical, and no later (ignored)
+    # duplicate occurrence ever participates.
+    raw_elements = header.split(",")
+    entries: list[tuple[int, str]] = [
+        (entry.position, raw_elements[entry.position - 1].strip())
+        for entry in parsed
+    ]
+
+    # Global enumeration: sizes ascend, so the first reproducing size is
+    # minimal; within a size only the serialized-length and then the
+    # position-sequence tie-break rules can replace the incumbent.
+    best_positions: tuple[int, ...] | None = None
+    best_sub_header: str | None = None
+    best_result: dict[str, Any] | None = None
+    for size in range(1, range_count + 1):
+        for combo in combinations(entries, size):
+            positions = tuple(position for position, _element in combo)
+            sub_header = ",".join(element for _position, element in combo)
+            reproduction = negotiate(
+                header=sub_header,
+                supported=supported,
+                default=default,
+                locale_fallbacks=locale_fallbacks,
+            )
+            if _outcome_key(reproduction) != baseline_key:
+                continue
+            if (
+                best_positions is None
+                or len(sub_header) < len(best_sub_header)
+                or (
+                    len(sub_header) == len(best_sub_header)
+                    and positions < best_positions
+                )
+            ):
+                best_positions = positions
+                best_sub_header = sub_header
+                best_result = reproduction
+        if best_positions is not None:
+            # Every larger subset is strictly worse; stop the search.
+            break
+
+    # The full header itself always reproduces the baseline, so a
+    # reproducing non-empty subset necessarily exists.
+    assert best_positions is not None
+    assert best_sub_header is not None
+    assert best_result is not None
+
+    kept_positions = list(best_positions)
+    kept_set = set(kept_positions)
+    removed_positions = [
+        entry.position for entry in parsed if entry.position not in kept_set
+    ]
+
+    message = (
+        f"全局枚举去重后 {range_count} 个语言范围的全部保序非空子集后，"
+        f"保留原位置 {kept_positions} 的 {len(kept_positions)} 个范围即可"
+        "复现 selected_language、fallback 与实际 locale_fallback 路径"
+        "（同数依次按序列化长度更短、原位置序列字典序更小取舍；"
+        "未使用逐项贪心）"
+    )
+
+    return {
+        "minimal_header": best_sub_header,
+        "kept_positions": kept_positions,
+        "removed_positions": removed_positions,
+        "baseline": baseline,
+        "reproduction": best_result,
         "message": message,
     }

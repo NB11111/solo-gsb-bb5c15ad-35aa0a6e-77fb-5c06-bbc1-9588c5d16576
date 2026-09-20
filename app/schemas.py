@@ -799,6 +799,34 @@ class ConfigProbeResponse(BaseModel):
     message: str
 
 
+class MinimizeHeaderResponse(BaseModel):
+    minimal_header: str = Field(
+        description=(
+            "保持 selected_language、fallback 及实际 locale_fallback 路径"
+            "完全一致的最小复现 Accept-Language 头（保序子集序列化结果）"
+        )
+    )
+    kept_positions: list[int] = Field(
+        description="最小头保留的范围在原 Accept-Language 头中的位置（1 开始，升序）"
+    )
+    removed_positions: list[int] = Field(
+        description=(
+            "最小头移除的去重范围首次出现位置（1 开始，升序）；"
+            "与 kept_positions 恰好划分全部去重后位置（不含被忽略的重复出现）"
+        )
+    )
+    baseline: NegotiationResponse = Field(
+        description="按现有规则得到的基准单人协商结果（与 /negotiate 完全一致）"
+    )
+    reproduction: NegotiationResponse = Field(
+        description=(
+            "用 minimal_header 重新协商的完整结果；其 selected_language、"
+            "fallback 与 locale_fallback 路径与 baseline 完全一致"
+        )
+    )
+    message: str
+
+
 class HealthResponse(BaseModel):
     status: Literal["ok"] = "ok"
     service: str
