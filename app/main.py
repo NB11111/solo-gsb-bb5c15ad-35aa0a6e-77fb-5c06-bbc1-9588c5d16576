@@ -15,6 +15,7 @@ from .negotiation import (
     SampleHeaderError,
     analyze_q_stability,
     assess_change_impact,
+    minimize_header,
     negotiate,
     negotiate_group,
     plan_config_probes,
@@ -31,6 +32,7 @@ from .schemas import (
     GroupNegotiationRequest,
     GroupNegotiationResponse,
     HealthResponse,
+    MinimizeHeaderResponse,
     NegotiationRequest,
     NegotiationResponse,
     QStabilityResponse,
@@ -59,6 +61,11 @@ app = FastAPI(
         "仅当某候选在两配置下结果不同时该候选可区分这对配置；穷举选出覆盖全部"
         "可区分配置对的最少候选（同数按候选下标序列字典序决胜），并返回每个探针"
         "新增覆盖的配置对与结果签名完全相同的不可区分配置组。"
+        "另提供 /api/v1/negotiate/minimize-header 最小复现头：请求体沿用单人"
+        "协商配置（Accept-Language 须含 1～12 个去重后范围），先取基准结果，再"
+        "全局枚举去重后范围的全部保序子集（非逐项贪心），选出仍保持"
+        " selected_language、fallback 及实际 locale_fallback 路径一致的最小头；"
+        "同数时依次取序列化长度更短、原位置序列字典序更小者。"
     ),
     version=__version__,
 )
@@ -342,6 +349,32 @@ async def negotiate_config_probes(
     return ConfigProbeResponse.model_validate(result)
 
 
+@app.post(
+    "/api/v1/negotiate/minimize-header",
+    response_model=MinimizeHeaderResponse,
+    tags=["语言协商"],
+    summary="保持协商结果一致的最小 Accept-Language 复现头",
+)
+async def negotiate_minimize_header(
+    payload: NegotiationRequest,
+) -> JSONResponse:
+    result = minimize_header(
+        header=payload.accept_language,
+        supported=payload.supported_languages,
+        default=payload.default_language,
+        locale_fallbacks=payload.locale_fallbacks,
+    )
+    body = {
+        "minimal_accept_language": result["minimal_accept_language"],
+        "kept_positions": result["kept_positions"],
+        "removed_positions": result["removed_positions"],
+        "baseline": _negotiation_body(result["baseline"]),
+        "reproduction": _negotiation_body(result["reproduction"]),
+        "message": result["message"],
+    }
+    return JSONResponse(content=body)
+
+
 @app.get("/", tags=["元信息"])
 async def root() -> dict[str, str]:
     return {
@@ -355,4 +388,5 @@ async def root() -> dict[str, str]:
         "negotiate_group": "POST /api/v1/negotiate/group",
         "negotiate_change_impact": "POST /api/v1/negotiate/change-impact",
         "negotiate_config_probes": "POST /api/v1/negotiate/config-probes",
+        "negotiate_minimize_header": "POST /api/v1/negotiate/minimize-header",
     }

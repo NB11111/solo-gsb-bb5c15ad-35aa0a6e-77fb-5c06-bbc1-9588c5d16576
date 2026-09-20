@@ -61,6 +61,15 @@ Implements the negotiation rules required by the service:
   separate every distinguishable pair, ties broken by the lexicographic
   candidate-index tuple. Configurations left mutually indistinguishable
   (identical signatures across every candidate) are reported as groups.
+* :func:`minimize_header` also reuses :func:`negotiate`: given a header
+  with 1-12 de-duplicated ranges it first records the baseline outcome
+  (selected language, fallback flag and the actual locale_fallbacks
+  path, including the null one) and then enumerates **every**
+  order-preserving subset of the de-duplicated ranges globally -- never
+  an item-by-item greedy pass -- keeping the smallest subset that
+  reproduces the baseline exactly; equal-size subsets are ranked by the
+  serialized length of the rebuilt header and then lexicographically by
+  their original-position sequence.
 
 Language tag grammar follows RFC 5646 (BCP 47) primary tag grammar, which
 covers every ordinary language tag (the legacy "grandfathered" irregular
@@ -69,6 +78,7 @@ tags from the RFC registry are intentionally rejected).
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -146,6 +156,16 @@ class ProbeHeaderError(AcceptLanguageError):
         super().__init__(
             f"第 {index + 1} 个候选 Accept-Language 头非法: {detail}"
         )
+
+
+class MinimizeHeaderError(AcceptLanguageError):
+    """The Accept-Language header is unsuitable for header minimization.
+
+    Raised when the header is missing/blank (no ranges at all) or carries
+    more than the allowed number of de-duplicated ranges. Plain syntax
+    errors keep being :class:`AcceptLanguageError`; the API layer maps
+    both to the same 422 envelope at ``["body", "accept_language"]``.
+    """
 
 
 class LocaleFallbackError(ValueError):
@@ -1617,5 +1637,157 @@ def plan_config_probes(
         "total_pair_count": total_pair_count,
         "distinguishable_pair_count": distinguishable_pair_count,
         "indistinguishable_groups": indistinguishable_groups,
+        "message": message,
+    }
+
+
+# Header minimization accepts exactly this many de-duplicated ranges; the
+# bound keeps the global subset enumeration (2**n - 1 reproductions) cheap
+# while covering ordinary Accept-Language headers.
+MINIMIZE_MAX_RANGES = 12
+
+
+def _outcome_signature(result: dict[str, Any]) -> tuple[Any, ...]:
+    """Comparable reproduction key for a negotiate() result.
+
+    The minimization contract requires the reproduction to keep
+    ``selected_language``, the ``fallback`` flag *and* the actual
+    locale_fallbacks path identical. The path is ``None`` whenever
+    locale_fallbacks did not select the language (both default fallback
+    and normal selection), so it also distinguishes a chain hit from an
+    otherwise identical non-chain outcome; comparing the tuple form
+    demands the same source range, q, position and node sequence.
+    """
+
+    report = result["locale_fallback"]
+    path = tuple(report["path"]) if report is not None else None
+    return (result["selected_language"], result["fallback"], path)
+
+
+def _rebuild_header(header: str, positions: tuple[int, ...]) -> str:
+    """Rebuild a header from a subset of 1-based comma-separated positions.
+
+    The chosen elements keep their exact raw spelling -- q tokens,
+    whitespace and case are untouched -- and stay in their original
+    order, so the rebuilt header's negotiation differs from the original
+    only by the removed elements. Positions are ascending.
+    """
+
+    elements = header.split(",")
+    return ",".join(elements[position - 1] for position in positions)
+
+
+def minimize_header(
+    header: str | None,
+    supported: list[str],
+    default: str,
+    locale_fallbacks: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Find the smallest order-preserving sub-header that reproduces the result.
+
+    The request body is the same single-person negotiation configuration,
+    but the header must contain between 1 and :data:`MINIMIZE_MAX_RANGES`
+    de-duplicated ranges (a missing/blank header has nothing to minimize;
+    later duplicate occurrences are dropped by first-wins parsing as
+    everywhere else and do not count).
+
+    A baseline :func:`negotiate` run fixes the required outcome. Every
+    non-empty subset of the de-duplicated ranges' original header
+    positions is then enumerated **globally**, by ascending subset size,
+    and the subset's rebuilt header is replayed through :func:`negotiate`
+    with the exact same server configuration. A subset *reproduces* the
+    baseline only when ``selected_language``, ``fallback`` and the actual
+    ``locale_fallback`` path (including the ``None`` case) all match. The
+    first reproducing size is therefore the minimum possible header;
+    within that size ties are broken by
+
+    1. the shorter serialized header length (``len(json.dumps(value))``,
+       matching the JSON wire representation), then
+    2. the lexicographically smaller tuple of original positions.
+
+    This is an exhaustive global search over all subsets -- sizes are
+    merely visited ascending for the minimum-size early stop, never an
+    item-by-item greedy removal. The full position set necessarily
+    reproduces the baseline (it rebuilds the original header), so a
+    winner always exists.
+    """
+
+    parsed = parse_accept_language(header)
+    if not parsed:
+        raise MinimizeHeaderError(
+            "Accept-Language 缺失或没有有效范围，无法做最小复现头归约"
+        )
+    if len(parsed) > MINIMIZE_MAX_RANGES:
+        raise MinimizeHeaderError(
+            f"去重后的语言范围有 {len(parsed)} 个，"
+            f"最小复现头接口仅接受 1～{MINIMIZE_MAX_RANGES} 个"
+        )
+
+    baseline = negotiate(
+        header=header,
+        supported=supported,
+        default=default,
+        locale_fallbacks=locale_fallbacks,
+    )
+    baseline_key = _outcome_signature(baseline)
+
+    all_positions = tuple(entry.position for entry in parsed)
+    total = len(all_positions)
+
+    # best_key = (serialized length, original-position tuple); scanning
+    # every combo of the minimum reproducing size applies the full global
+    # tie-break contract rather than a greedy "remove while unchanged".
+    best_positions: tuple[int, ...] | None = None
+    best_key: tuple[int, tuple[int, ...]] | None = None
+    minimum_size = total
+    for size in range(1, total + 1):
+        for combo in combinations(all_positions, size):
+            rebuilt = _rebuild_header(header or "", combo)
+            reproduction = negotiate(
+                header=rebuilt,
+                supported=supported,
+                default=default,
+                locale_fallbacks=locale_fallbacks,
+            )
+            if _outcome_signature(reproduction) != baseline_key:
+                continue
+            key = (len(json.dumps(rebuilt, ensure_ascii=False)), combo)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_positions = combo
+        if best_positions is not None:
+            minimum_size = size
+            break
+
+    # The full set rebuilds the original header, so it always reproduces.
+    assert best_positions is not None and best_key is not None
+    minimal_header = _rebuild_header(header or "", best_positions)
+    reproduction = negotiate(
+        header=minimal_header,
+        supported=supported,
+        default=default,
+        locale_fallbacks=locale_fallbacks,
+    )
+    kept = list(best_positions)
+    removed = [
+        position
+        for position in all_positions
+        if position not in best_positions
+    ]
+
+    message = (
+        f"先取基准结果，再对去重后 {total} 个语言范围的全部保序子集做全局枚举"
+        f"（非空子集共 {2 ** total - 1} 个，按规模从小到大扫描，首个存在复现的"
+        f"规模即最小）：保留 {minimum_size} 个范围即可保持 selected_language、"
+        "fallback 及实际 locale_fallback 路径与基准一致；同数时依次取序列化长度"
+        "更短、原位置序列字典序更小者（全局枚举，非逐项贪心）"
+    )
+
+    return {
+        "minimal_accept_language": minimal_header,
+        "kept_positions": kept,
+        "removed_positions": removed,
+        "baseline": baseline,
+        "reproduction": reproduction,
         "message": message,
     }

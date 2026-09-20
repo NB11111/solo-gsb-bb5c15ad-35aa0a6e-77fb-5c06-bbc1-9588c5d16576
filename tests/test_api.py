@@ -1512,3 +1512,214 @@ def test_config_probes_extra_field_rejected_422():
         }
     )
     assert response.status_code == 422
+
+
+def _post_minimize(payload):
+    return client.post("/api/v1/negotiate/minimize-header", json=payload)
+
+
+def test_minimize_header_success():
+    response = _post_minimize(
+        {
+            "accept_language": "de,fr,en;q=0,*;q=0.5",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    # en;q=0 keeps en-US excluded; the wildcard then selects zh-CN.
+    # The two unmatched concrete ranges are redundant.
+    assert body["minimal_accept_language"] == "en;q=0,*;q=0.5"
+    assert body["kept_positions"] == [3, 4]
+    assert body["removed_positions"] == [1, 2]
+    assert body["baseline"]["selected_language"] == "zh-CN"
+    assert body["reproduction"]["selected_language"] == "zh-CN"
+    assert body["baseline"]["fallback"] is False
+    assert body["reproduction"]["fallback"] is False
+    # Unused locale_fallbacks: the key is dropped from both reports,
+    # exactly like /negotiate.
+    assert "locale_fallback" not in body["baseline"]
+    assert "locale_fallback" not in body["reproduction"]
+    # Baseline carries the full negotiation payload.
+    assert len(body["baseline"]["candidates"]) == len(SUPPORTED)
+    assert [r["range"] for r in body["reproduction"]["parsed_ranges"]] == [
+        "en",
+        "*",
+    ]
+
+
+def test_minimize_header_single_range_winner():
+    response = _post_minimize(
+        {
+            "accept_language": "de,fr,ja;q=0.8,zh;q=0.9,en;q=0.7",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["minimal_accept_language"] == "zh;q=0.9"
+    assert body["kept_positions"] == [4]
+    assert body["removed_positions"] == [1, 2, 3, 5]
+    assert body["reproduction"]["selected_language"] == "zh-CN"
+
+
+def test_minimize_header_tie_serialized_length_then_positions():
+    # Neither tag matches: both singletons reproduce the default
+    # fallback; the shorter serialized header wins regardless of its
+    # original position.
+    response = _post_minimize(
+        {
+            "accept_language": "xxxx;q=0.9,aa",
+            "supported_languages": ["en-US"],
+            "default_language": "en-US",
+        }
+    )
+    assert response.status_code == 200
+    assert response.json()["minimal_accept_language"] == "aa"
+
+    # Equal serialized length: the lexicographically smaller original
+    # position sequence wins.
+    response = _post_minimize(
+        {
+            "accept_language": "xx;q=0.9,yy;q=0.8",
+            "supported_languages": ["en-US"],
+            "default_language": "en-US",
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["minimal_accept_language"] == "xx;q=0.9"
+    assert body["kept_positions"] == [1]
+    assert body["removed_positions"] == [2]
+
+
+def test_minimize_header_locale_fallback_path_must_match():
+    chains = {"gsw": "de", "de": "it", "it": "fr-FR"}
+    response = _post_minimize(
+        {
+            "accept_language": "gsw,de;q=0,it;q=0.1",
+            "supported_languages": ["de", "fr-FR"],
+            "default_language": "fr-FR",
+            "locale_fallbacks": chains,
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    # Both gsw (chain source) and de;q=0 (keeps the walk from stopping at
+    # supported node "de") are required; it;q=0.1 would reach fr-FR via a
+    # different path and is therefore not a valid reproduction.
+    assert body["minimal_accept_language"] == "gsw,de;q=0"
+    assert body["kept_positions"] == [1, 2]
+    assert body["removed_positions"] == [3]
+    path = ["gsw", "de", "it", "fr-fr"]
+    assert body["baseline"]["locale_fallback"]["path"] == path
+    assert body["reproduction"]["locale_fallback"]["path"] == path
+    assert (
+        body["baseline"]["locale_fallback"]["selected_language"]
+        == body["reproduction"]["locale_fallback"]["selected_language"]
+        == "fr-FR"
+    )
+
+
+def test_minimize_header_blank_header_422():
+    response = _post_minimize(
+        {
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"][0]
+    assert detail["loc"] == ["body", "accept_language"]
+    assert detail["type"] == "accept_language.syntax_error"
+
+
+def test_minimize_header_invalid_syntax_422():
+    response = _post_minimize(
+        {
+            "accept_language": "en;q=2",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"][0]
+    assert detail["loc"] == ["body", "accept_language"]
+    assert detail["type"] == "accept_language.syntax_error"
+
+
+def test_minimize_header_too_many_ranges_422():
+    tags = [
+        "af", "sq", "ar", "an", "hy", "as", "av", "ae",
+        "ay", "az", "bm", "ba", "eu",
+    ]
+    response = _post_minimize(
+        {
+            "accept_language": ",".join(tags),
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"][0]
+    assert detail["loc"] == ["body", "accept_language"]
+    assert "13" in detail["msg"]
+    assert detail["type"] == "accept_language.syntax_error"
+
+
+def test_minimize_header_twelve_ranges_accepted_duplicates_ignored():
+    tags = [
+        "af", "sq", "ar", "an", "hy", "as", "av", "ae",
+        "ay", "az", "bm", "ba",
+    ]
+    # 14 comma-separated elements but only 12 distinct ranges.
+    response = _post_minimize(
+        {
+            "accept_language": ",".join(tags) + ",AF,SQ",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["kept_positions"]) + len(body["removed_positions"]) == 12
+
+
+def test_minimize_header_default_not_in_supported_422():
+    response = _post_minimize(
+        {
+            "accept_language": "en",
+            "supported_languages": SUPPORTED,
+            "default_language": "fr-FR",
+        }
+    )
+    assert response.status_code == 422
+
+
+def test_minimize_header_extra_field_rejected_422():
+    response = _post_minimize(
+        {
+            "accept_language": "en",
+            "supported_languages": ["en"],
+            "default_language": "en",
+            "unexpected": 1,
+        }
+    )
+    assert response.status_code == 422
+
+
+def test_minimize_header_locale_fallbacks_validation_422():
+    response = _post_minimize(
+        {
+            "accept_language": "de",
+            "supported_languages": ["en-US"],
+            "default_language": "en-US",
+            "locale_fallbacks": {"de": "xx", "xx": "yy"},
+        }
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"][0]
+    assert detail["loc"] == ["body", "locale_fallbacks"]
+    assert "悬空" in detail["msg"]

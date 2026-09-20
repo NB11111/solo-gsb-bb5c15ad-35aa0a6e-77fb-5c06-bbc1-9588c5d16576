@@ -312,6 +312,34 @@ class QSteerResponse(BaseModel):
     )
 
 
+class MinimizeHeaderResponse(BaseModel):
+    """Result of the global minimal reproducing-header search."""
+
+    minimal_accept_language: str = Field(
+        description=(
+            "保持 selected_language、fallback 及实际 locale_fallback 路径"
+            "均与基准一致的最小复现 Accept-Language 头"
+            "（保留元素沿用原文拼写、保持原序）"
+        )
+    )
+    kept_positions: list[int] = Field(
+        description=(
+            "最小头保留的去重后范围在原始 Accept-Language 头中的位置"
+            "（从 1 开始，升序）"
+        )
+    )
+    removed_positions: list[int] = Field(
+        description="从去重后范围中移除的原始位置（从 1 开始，升序）"
+    )
+    baseline: NegotiationResponse = Field(
+        description="按现有规则得到的基准单人协商结果（与 /negotiate 完全一致）"
+    )
+    reproduction: NegotiationResponse = Field(
+        description="以最小复现头重新协商的完整结果（关键结果与基准一致）"
+    )
+    message: str
+
+
 class GroupParticipant(BaseModel):
     """One group member: a unique id plus their raw Accept-Language header."""
 
